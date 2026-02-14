@@ -305,11 +305,26 @@ class TrendsDialog(tk.Toplevel):
         canvas_scroll.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Bind mousewheel
+        # Bind mousewheel only while this dialog exists
+        self._canvas_scroll = canvas_scroll
+
         def _on_mousewheel(event):
-            canvas_scroll.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            try:
+                canvas_scroll.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except tk.TclError:
+                pass
+
         canvas_scroll.bind_all("<MouseWheel>", _on_mousewheel)
-        self.protocol("WM_DELETE_WINDOW", lambda: (canvas_scroll.unbind_all("<MouseWheel>"), self.destroy()))
+
+        def _on_close():
+            try:
+                canvas_scroll.unbind_all("<MouseWheel>")
+            except tk.TclError:
+                pass
+            self.destroy()
+
+        self.protocol("WM_DELETE_WINDOW", _on_close)
+        self.bind("<Destroy>", lambda e: self._unbind_mousewheel() if e.widget is self else None)
 
         # Create chart widgets
         for metal, info in METALS.items():
@@ -325,6 +340,12 @@ class TrendsDialog(tk.Toplevel):
         self._empty_label.pack(pady=8)
 
         self._load_and_display()
+
+    def _unbind_mousewheel(self):
+        try:
+            self._canvas_scroll.unbind_all("<MouseWheel>")
+        except (tk.TclError, AttributeError):
+            pass
 
     def _set_period(self, days):
         self._period_days = days
