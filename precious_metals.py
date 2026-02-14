@@ -299,8 +299,15 @@ class TrendsDialog(tk.Toplevel):
             "<Configure>",
             lambda e: canvas_scroll.configure(scrollregion=canvas_scroll.bbox("all")),
         )
-        canvas_scroll.create_window((0, 0), window=self._scroll_frame, anchor="nw")
+        self._scroll_window_id = canvas_scroll.create_window(
+            (0, 0), window=self._scroll_frame, anchor="nw",
+        )
         canvas_scroll.configure(yscrollcommand=scrollbar.set)
+
+        # Keep scroll_frame width in sync with canvas so charts fill properly
+        def _sync_frame_width(event):
+            canvas_scroll.itemconfig(self._scroll_window_id, width=event.width)
+        canvas_scroll.bind("<Configure>", _sync_frame_width)
 
         canvas_scroll.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
