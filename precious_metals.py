@@ -952,6 +952,12 @@ class App(tk.Tk):
             font=("Segoe UI", 8), fg=FG_DIM, bg=BG_DARK, anchor="w",
         ).pack(side="left")
 
+        self.next_update_var = tk.StringVar(value="")
+        tk.Label(
+            status_frame, textvariable=self.next_update_var,
+            font=("Segoe UI", 8), fg=FG_DIM, bg=BG_DARK, anchor="w",
+        ).pack(side="left", padx=(8, 0))
+
         tk.Button(
             status_frame, text="CSV", font=("Segoe UI", 8),
             bg=BG_BTN, fg=FG_TEXT, relief="flat", padx=6, pady=1,
@@ -1142,6 +1148,8 @@ class App(tk.Tk):
                 self.status_var.set("Updated just now")
 
         mins = self.config_data.get("refresh_minutes", 30)
+        next_time = datetime.now() + timedelta(minutes=mins)
+        self.next_update_var.set(f"Next: {next_time.strftime('%H:%M:%S')}")
         self._refresh_job = self.after(mins * 60 * 1000, self._trigger_refresh)
 
     def _check_alerts(self, metals):
