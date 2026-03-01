@@ -12,6 +12,7 @@ Features:
 - CSV price history export
 - System tray mode
 - Always-on-top and compact mode
+- Price trend charts (24h / 7d / 14d) from local history
 """
 
 import tkinter as tk
@@ -24,7 +25,7 @@ import threading
 import urllib.request
 import urllib.error
 import winsound
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
@@ -119,6 +120,265 @@ def fetch_prices(api_key, currency="AUD"):
     if data.get("status") != "success":
         raise ValueError(data.get("error", "Unknown API error"))
     return data
+
+
+def load_history(days=14, currency=None):
+    """Load price history from CSV, filtered to last N days and optional currency.
+    Returns dict: {metal_name: [(datetime, price), ...]}
+    """
+    result = {m: [] for m in METALS}
+    if not os.path.exists(HISTORY_FILE):
+        return result
+    cutoff = datetime.now() - timedelta(days=days)
+    with open(HISTORY_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if currency and row.get("currency", "") != currency:
+                continue
+            try:
+                ts = datetime.fromisoformat(row["timestamp"])
+            except (ValueError, KeyError):
+                continue
+            if ts < cutoff:
+                continue
+            for metal in METALS:
+                val = row.get(metal, "")
+                if val:
+                    try:
+                        result[metal].append((ts, float(val)))
+                    except ValueError:
+                        pass
+    return result
+
+
+class TrendChart(tk.Canvas):
+    """A simple line chart drawn on a tkinter Canvas."""
+
+    def __init__(self, parent, metal_name, color, height=110, **kwargs):
+        super().__init__(
+            parent, bg=BG_CARD, highlightthickness=0,
+            height=height, **kwargs,
+        )
+        self.metal_name = metal_name
+        self.line_color = color
+        self._data = []
+        self._margin = {"left": 60, "right": 16, "top": 24, "bottom": 24}
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set_data(self, data):
+        """data: list of (datetime, price) tuples, sorted by time."""
+        self._data = data
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        m = self._margin
+
+        # Title
+        self.create_text(
+            m["left"], 6, text=self.metal_name.capitalize(),
+            font=("Segoe UI", 9, "bold"), fill=self.line_color, anchor="nw",
+        )
+
+        plot_x = m["left"]
+        plot_w = w - m["left"] - m["right"]
+        plot_y = m["top"]
+        plot_h = h - m["top"] - m["bottom"]
+
+        if len(self._data) < 2 or plot_w < 20 or plot_h < 20:
+            self.create_text(
+                w // 2, h // 2, text="Not enough data",
+                font=("Segoe UI", 8), fill=FG_DIM,
+            )
+            return
+
+        prices = [p for _, p in self._data]
+        times = [t for t, _ in self._data]
+        p_min = min(prices)
+        p_max = max(prices)
+        p_range = p_max - p_min if p_max != p_min else 1.0
+        t_min = min(times).timestamp()
+        t_max = max(times).timestamp()
+        t_range = t_max - t_min if t_max != t_min else 1.0
+
+        # Grid lines (3 horizontal)
+        for i in range(4):
+            gy = plot_y + plot_h - (plot_h * i / 3)
+            gval = p_min + p_range * i / 3
+            self.create_line(plot_x, gy, plot_x + plot_w, gy, fill="#313244", dash=(2, 4))
+            self.create_text(
+                plot_x - 4, gy, text=f"${gval:,.0f}",
+                font=("Segoe UI", 7), fill=FG_DIM, anchor="e",
+            )
+
+        # Time labels along bottom
+        n_labels = min(5, len(self._data))
+        for i in range(n_labels):
+            idx = int(i * (len(self._data) - 1) / max(n_labels - 1, 1))
+            t = times[idx]
+            tx = plot_x + (t.timestamp() - t_min) / t_range * plot_w
+            label = t.strftime("%d/%m %H:%M")
+            self.create_text(
+                tx, plot_y + plot_h + 4, text=label,
+                font=("Segoe UI", 6), fill=FG_DIM, anchor="n",
+            )
+
+        # Plot line
+        points = []
+        for t, p in self._data:
+            x = plot_x + (t.timestamp() - t_min) / t_range * plot_w
+            y = plot_y + plot_h - (p - p_min) / p_range * plot_h
+            points.append(x)
+            points.append(y)
+
+        if len(points) >= 4:
+            self.create_line(*points, fill=self.line_color, width=2, smooth=True)
+
+        # Min/max labels
+        first_price = prices[0]
+        last_price = prices[-1]
+        change = last_price - first_price
+        pct = (change / first_price * 100) if first_price != 0 else 0
+        arrow = "\u25B2" if change > 0 else "\u25BC" if change < 0 else ""
+        color = FG_GREEN if change > 0 else FG_RED if change < 0 else FG_DIM
+        self.create_text(
+            w - m["right"], 6,
+            text=f"{arrow} {abs(pct):.1f}%",
+            font=("Segoe UI", 8, "bold"), fill=color, anchor="ne",
+        )
+
+
+class TrendsDialog(tk.Toplevel):
+    """Window showing price trend charts for all metals."""
+
+    def __init__(self, parent, currency):
+        super().__init__(parent)
+        self.title("Price Trends")
+        self.geometry("540x560")
+        self.configure(bg=BG_DARK)
+        self.minsize(400, 400)
+        self.transient(parent)
+
+        self.currency = currency
+        self._period_days = 14
+        self.charts = {}
+
+        # Header
+        tk.Label(
+            self, text="Price Trends",
+            font=("Segoe UI", 14, "bold"), fg=FG_ACCENT, bg=BG_DARK,
+        ).pack(pady=(12, 4))
+
+        # Period selector
+        period_frame = tk.Frame(self, bg=BG_DARK)
+        period_frame.pack(pady=(0, 8))
+
+        self._period_btns = {}
+        for label, days in [("24h", 1), ("7d", 7), ("14d", 14)]:
+            btn = tk.Button(
+                period_frame, text=label, font=("Segoe UI", 9),
+                bg=BG_BTN_PRIMARY if days == 14 else BG_BTN,
+                fg=BG_DARK if days == 14 else FG_TEXT,
+                relief="flat", padx=12, pady=2, cursor="hand2",
+                command=lambda d=days: self._set_period(d),
+            )
+            btn.pack(side="left", padx=3)
+            self._period_btns[days] = btn
+
+        # Charts container with scrollbar
+        container = tk.Frame(self, bg=BG_DARK)
+        container.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+        canvas_scroll = tk.Canvas(container, bg=BG_DARK, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas_scroll.yview)
+        self._scroll_frame = tk.Frame(canvas_scroll, bg=BG_DARK)
+
+        self._scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas_scroll.configure(scrollregion=canvas_scroll.bbox("all")),
+        )
+        self._scroll_window_id = canvas_scroll.create_window(
+            (0, 0), window=self._scroll_frame, anchor="nw",
+        )
+        canvas_scroll.configure(yscrollcommand=scrollbar.set)
+
+        # Keep scroll_frame width in sync with canvas so charts fill properly
+        def _sync_frame_width(event):
+            canvas_scroll.itemconfig(self._scroll_window_id, width=event.width)
+        canvas_scroll.bind("<Configure>", _sync_frame_width)
+
+        canvas_scroll.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Bind mousewheel only while this dialog exists
+        self._canvas_scroll = canvas_scroll
+
+        def _on_mousewheel(event):
+            try:
+                canvas_scroll.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except tk.TclError:
+                pass
+
+        canvas_scroll.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _on_close():
+            try:
+                canvas_scroll.unbind_all("<MouseWheel>")
+            except tk.TclError:
+                pass
+            self.destroy()
+
+        self.protocol("WM_DELETE_WINDOW", _on_close)
+        self.bind("<Destroy>", lambda e: self._unbind_mousewheel() if e.widget is self else None)
+
+        # Create chart widgets
+        for metal, info in METALS.items():
+            chart = TrendChart(self._scroll_frame, metal, info["color"])
+            chart.pack(fill="x", pady=(0, 6), ipady=4)
+            self.charts[metal] = chart
+
+        # Empty state label
+        self._empty_label = tk.Label(
+            self._scroll_frame, text="",
+            font=("Segoe UI", 10), fg=FG_DIM, bg=BG_DARK,
+        )
+        self._empty_label.pack(pady=8)
+
+        self._load_and_display()
+
+    def _unbind_mousewheel(self):
+        try:
+            self._canvas_scroll.unbind_all("<MouseWheel>")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _set_period(self, days):
+        self._period_days = days
+        for d, btn in self._period_btns.items():
+            if d == days:
+                btn.config(bg=BG_BTN_PRIMARY, fg=BG_DARK)
+            else:
+                btn.config(bg=BG_BTN, fg=FG_TEXT)
+        self._load_and_display()
+
+    def _load_and_display(self):
+        history = load_history(days=self._period_days, currency=self.currency)
+        has_data = any(len(v) >= 2 for v in history.values())
+
+        if not has_data:
+            self._empty_label.config(
+                text="No trend data yet. Prices are logged each refresh\n"
+                     "— check back after the app has been running a while.",
+            )
+        else:
+            self._empty_label.config(text="")
+
+        for metal, chart in self.charts.items():
+            data = history.get(metal, [])
+            data.sort(key=lambda x: x[0])
+            chart.set_data(data)
 
 
 class MetalCard(tk.Frame):
@@ -657,6 +917,7 @@ class App(tk.Tk):
         tk.Button(title_frame, text="\u2699", command=self._open_settings, **btn_cfg).pack(side="right")
         tk.Button(title_frame, text="\U0001F4BC", command=self._open_portfolio, **btn_cfg).pack(side="right")
         tk.Button(title_frame, text="\u26A0", command=self._open_alerts, **btn_cfg).pack(side="right")
+        tk.Button(title_frame, text="\U0001F4C8", command=self._open_trends, **btn_cfg).pack(side="right")
 
         # Currency / unit toggle row
         toggle_frame = tk.Frame(self, bg=BG_DARK)
@@ -718,6 +979,12 @@ class App(tk.Tk):
             status_frame, textvariable=self.status_var,
             font=("Segoe UI", 8), fg=FG_DIM, bg=BG_DARK, anchor="w",
         ).pack(side="left")
+
+        self.next_update_var = tk.StringVar(value="")
+        tk.Label(
+            status_frame, textvariable=self.next_update_var,
+            font=("Segoe UI", 8), fg=FG_DIM, bg=BG_DARK, anchor="w",
+        ).pack(side="left", padx=(8, 0))
 
         tk.Button(
             status_frame, text="CSV", font=("Segoe UI", 8),
@@ -823,6 +1090,9 @@ class App(tk.Tk):
     def _on_alerts_saved(self, new_config):
         self.config_data = new_config
 
+    def _open_trends(self):
+        TrendsDialog(self, self.config_data.get("currency", "AUD"))
+
     def _export_csv(self):
         if not os.path.exists(HISTORY_FILE):
             messagebox.showinfo("Export", "No price history recorded yet.")
@@ -906,6 +1176,8 @@ class App(tk.Tk):
                 self.status_var.set("Updated just now")
 
         mins = self.config_data.get("refresh_minutes", 30)
+        next_time = datetime.now() + timedelta(minutes=mins)
+        self.next_update_var.set(f"Next: {next_time.strftime('%H:%M:%S')}")
         self._refresh_job = self.after(mins * 60 * 1000, self._trigger_refresh)
 
     def _check_alerts(self, metals):
